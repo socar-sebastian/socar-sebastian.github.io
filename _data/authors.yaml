@@ -289,6 +289,16 @@ rudy:
   links:
     linkedin: 'https://www.linkedin.com/in/yangseunghyeon/'
 
+
+arnold:
+  name: 아놀드
+  image: '/assets/authors/arnold.png'
+  position: FE CORE 팀 프론트엔드 개발자
+  introduction: 쏘카의 프론트엔드 공통역역 개발을 하고 있습니다.
+  links:
+    blog: "https://www.cloud-sanghun.com/"
+    linkedin: "https://www.linkedin.com/in/sanghun-lee-905a84144/"
+
 sio:
   name: 시오
   image: '/assets/authors/sio.png'
@@ -296,3 +306,4 @@ sio:
   introduction: 테스트 전략과 자동화에 진심이며 서비스 품질 향상을 위해 고민하는 QA입니다.
   links:
     linkedin: 'https://www.linkedin.com/in/jiye-jeon-40a813254/'
+

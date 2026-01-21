@@ -2,10 +2,10 @@
 layout: post
 title: "Node.js 컨테이너, 왜 깔끔하게 안 죽을까? (feat. Graceful shutdown)"
 subtitle: SIGTERM, PID 1, 그리고 Node.js 이벤트 루프
-date: 2025-01-20 00:00:00 +0900
+date: 2026-01-20 00:00:00 +0900
 category: dev
 background: "/img/simple-background.png"
-author: sebastian
+author: [sebastian, ruru]
 comments: true
 tags:
   - nodejs

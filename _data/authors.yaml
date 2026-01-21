@@ -306,6 +306,14 @@ sio:
   links:
     linkedin: 'https://www.linkedin.com/in/jiye-jeon-40a813254/'
 
+abel:
+  name: 아벨
+  image: '/assets/authors/abel.png'
+  position: iOS 개발자
+  introduction: 쏘카에서 iOS 앱 개발을 하고 있습니다.
+  links:
+    linkedin: 'https://www.linkedin.com/in/%EC%83%81%EC%9A%B0-%EA%B9%80-55a85a238/'
+
 aron:
   name: 아릉
   image: '/assets/images/aron.png'
@@ -313,3 +321,4 @@ aron:
   introduction: 바람직한 체계를 구축하고 그로부터 다수의 행복에 기여할 수 있는 선순환을 만드는 것을 추구합니다.
   links:
     linkedin: 'https://www.linkedin.com/in/dongheekim85/'
+

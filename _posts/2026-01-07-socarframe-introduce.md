@@ -8,7 +8,7 @@ background : "/assets/images/onboarding-bg.jpg"
 author: aron
 comments: true
 tags:
-    - socarframe, 
+    - socarframe
     - mobile
     - app
 ---

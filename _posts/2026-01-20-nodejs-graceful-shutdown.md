@@ -5,7 +5,7 @@ subtitle: SIGTERM, PID 1, 그리고 Node.js 이벤트 루프
 date: 2026-01-20 00:00:00 +0900
 category: dev
 background: "/img/simple-background.png"
-author: [sebastian, ruru]
+author: sebastian, ruru
 comments: true
 tags:
   - nodejs

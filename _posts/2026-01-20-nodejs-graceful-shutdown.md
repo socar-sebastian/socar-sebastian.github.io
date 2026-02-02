@@ -16,6 +16,8 @@ tags:
 
 배치 컨슈머 앱을 운영하다 보면 "분명 종료 시그널 넣었는데 왜 안 죽지?"라는 상황을 한 번쯤 겪게 됩니다.
 
+**그레이스풀 셧다운(Graceful Shutdown)**이란 서버가 종료 요청을 받았을 때, 진행 중인 작업을 안전하게 마무리하고 리소스를 정리한 뒤 종료하는 방식입니다. 본 글에서는 Node.js 컨테이너 환경에서 그레이스풀 셧다운이 제대로 동작하지 않는 원인을 분석하고, 실무 적용 시 고려사항을 다룹니다.
+
 저희 팀 역시 최근 이 문제로 꽤 고생했습니다. 처음에는 단순히 시그널 처리 문제라고 생각했지만, 파고들다 보니 **Linux 커널의 PID 1 보호 메커니즘**과 **Node.js 이벤트 루프 동작 방식**이 함께 얽힌 문제였습니다. 그 과정에서 겪은 삽질을 정리해봅니다.
 
 ---
@@ -48,13 +50,15 @@ Kubernetes는 Pod를 종료할 때 먼저 SIGTERM을 보냅니다. 애플리케�
 
 구글링을 해보면 "Node.js는 PID 1 역할을 하도록 설계되지 않아서 시그널을 못 받는다"라는 설명을 자주 볼 수 있습니다. 하지만 이는 절반만 맞는 이야기입니다.
 
-실제로는 **Linux 커널이 PID 1 프로세스를 특별하게 보호**합니다. 일반 프로세스(PID ≥ 2)는 시그널 핸들러가 없으면 커널의 기본 동작에 따라 종료되지만, PID 1은 핸들러가 없을 경우 시그널을 무시합니다. "Global init gets no signals it doesn't want"라는 커널 설계 원칙 때문입니다.
+실제로는 **Linux 커널이 PID 1 프로세스를 특별하게 보호**합니다. 일반 프로세스(PID ≥ 2)는 시그널 핸들러가 없으면 커널의 기본 동작에 따라 종료됩니다. 하지만 PID 1은 핸들러가 없을 경우 시그널을 무시합니다. "Global init gets no signals it doesn't want"라는 커널 설계 원칙 때문입니다.
 
-NestJS에서 `app.enableShutdownHooks()`를 통해 시그널 핸들러를 등록했다면 PID 1이라도 SIGTERM을 받을 수는 있습니다. 다만 실제 문제는 **좀비 프로세스 정리(reaping)**와 **자식/손자 프로세스에 대한 시그널 전파를 Node.js가 책임지지 않는다는 점**이었습니다.
+NestJS에서 [`app.enableShutdownHooks()`](https://docs.nestjs.com/fundamentals/lifecycle-events#application-shutdown)를 통해 시그널 핸들러를 등록했다면 PID 1이라도 SIGTERM을 받을 수는 있습니다. 다만 실제 문제는 **좀비 프로세스 정리(reaping)**와 **자식/손자 프로세스에 대한 시그널 전파를 Node.js가 책임지지 않는다는 점**이었습니다.
 
 ### 해결: dumb-init 도입
 
-결국 시그널 전달과 프로세스 관리는 전문 init 시스템에 맡기는 것이 표준적인 접근이었습니다.
+결국 시그널 전달과 프로세스 관리는 전문 init 시스템에 맡기는 것이 표준적인 접근이었습니다. [dumb-init](https://github.com/Yelp/dumb-init)은 컨테이너 환경에서 PID 1로 동작하며 시그널 전파와 좀비 프로세스 정리를 담당합니다.
+
+**dumb-init을 활용한 Dockerfile 예시:**
 
 ```dockerfile
 # Dockerfile
@@ -80,7 +84,7 @@ Node.js 프로세스는 이벤트 루프가 완전히 비워져야 종료됩니�
 - 내부의 `await sleep(10000)` 같은 비동기 작업이 이벤트 루프에 계속 남아 있음
 - Node.js는 "아직 처리할 작업이 남아 있다"고 판단하고 종료를 미룸
 
-실제 로그 흐름도 이를 그대로 보여주고 있었습니다.
+**실제 로그 흐름 - 타임아웃 후에도 프로세스가 종료되지 않는 상황:**
 
 ```
 16:07:20  K8s SIGTERM 수신 -> onModuleDestroy 호출
@@ -99,8 +103,9 @@ Node.js 프로세스는 이벤트 루프가 완전히 비워져야 종료됩니�
 
 `AbortController`를 쓰면 백그라운드에서 돌고 있는 루프를 명시적으로 멈출 수 있거든요.
 
+**AbortController를 활용한 중단 패턴 (검토했으나 미채택):**
+
 ```typescript
-// 고민했던 구조
 async doBatch() {
   for (const job of jobs) {
     if (this.abortController.signal.aborted) {
@@ -133,6 +138,8 @@ async onModuleDestroy() {
 
 ### 애플리케이션 레벨: 셧다운 훅 + 타임아웃
 
+**NestJS 셧다운 훅과 타임아웃 처리:**
+
 ```typescript
 // main.ts
 app.enableShutdownHooks();
@@ -157,9 +164,11 @@ async onModuleDestroy() {
 
 ### 인프라 레벨: K8s Grace Period 조정
 
-애플리케이션 타임아웃보다 `terminationGracePeriodSeconds`를 더 길게 설정했습니다.
+애플리케이션 타임아웃보다 [`terminationGracePeriodSeconds`](https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/#pod-termination)를 더 길게 설정했습니다.
 
 **앱 타임아웃(2분) < K8s Grace Period(3분)**
+
+**Kubernetes Deployment 설정 예시:**
 
 ```yaml
 # deployment.yaml
@@ -185,9 +194,9 @@ Node.js 이벤트 루프, PID 1 프로세스, Kubernetes 종료 정책은 서로
 
 ### 핵심 요약
 
-- **Init 프로세스 사용**: dumb-init이나 tini로 시그널 전달 및 좀비 프로세스 방지
+- **Init 프로세스 사용**: [dumb-init](https://github.com/Yelp/dumb-init)이나 [tini](https://github.com/krallin/tini)로 시그널 전달 및 좀비 프로세스 방지
 - **Node 직접 실행**: `npm start` 대신 `node dist/main`으로 (시그널 전달 방해 방지)
 - **이벤트 루프 이해**: return만으로 프로세스가 종료되지 않음. 비동기 작업이 남았으면 끝날 때까지 살아있음
-- **설정 동기화**: 앱 타임아웃보다 K8s terminationGracePeriodSeconds를 더 길게
+- **설정 동기화**: 앱 타임아웃보다 K8s [terminationGracePeriodSeconds](https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/#pod-termination)를 더 길게
 
 결국 종료 훅을 넣는 것보다 중요한 건, **내 앱의 비동기 작업이 이벤트 루프를 얼마나 점유하고 있는지 이해하고 제어하는 것**이었습니다. 개발적인 관점 너머, 여러가지 기술적인 해결책들이 있을때, 오버엔지니어링 보다는 이 문제의 배경이 무엇이고, 풀고자 하는 문제점이 무엇인지 정확하게 파악 후 해결책을 선택하는 것 또한 중요하다고 생각합니다.

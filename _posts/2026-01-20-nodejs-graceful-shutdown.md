@@ -16,6 +16,8 @@ tags:
 
 > 그레이스풀 셧다운(Graceful Shutdown)이란 서버가 종료 요청을 받았을 때, 진행 중인 작업을 안전하게 마무리하고 리소스를 정리한 뒤 종료하는 방식입니다.
 
+이 글에서는 Node.js 컨테이너 환경에서 graceful shutdown이 제대로 동작하지 않는 원인을 분석하고, Linux PID 1 메커니즘과 이벤트 루프 관점에서 해결 방법을 다룹니다.
+
 배치 컨슈머 앱을 운영하다 보면 "분명 종료 시그널 넣었는데 왜 안 죽지?"라는 상황을 한 번쯤 겪게 됩니다.
 
 저희 팀 역시 최근 이 문제로 꽤 고생했습니다. 처음에는 단순히 시그널 처리 문제라고 생각했지만, 파고들다 보니 **Linux 커널의 PID 1 보호 메커니즘**과 **Node.js 이벤트 루프 동작 방식**이 함께 얽힌 문제였습니다. 그 과정에서 겪은 삽질을 정리해봅니다.
@@ -50,7 +52,7 @@ Kubernetes는 Pod를 종료할 때 먼저 SIGTERM을 보냅니다. 애플리케�
 
 구글링을 해보면 "Node.js는 PID 1 역할을 하도록 설계되지 않아서 시그널을 못 받는다"라는 설명을 자주 볼 수 있습니다. 하지만 이는 절반만 맞는 이야기입니다.
 
-실제로는 **Linux 커널이 PID 1 프로세스를 특별하게 보호**합니다. 일반 프로세스(PID ≥ 2)는 시그널 핸들러가 없으면 커널의 기본 동작에 따라 종료됩니다. 하지만 PID 1은 핸들러가 없을 경우 시그널을 무시합니다. "Global init gets no signals it doesn't want"라는 커널 설계 원칙 때문입니다.
+실제로는 **Linux 커널이 PID 1 프로세스를 특별하게 보호**합니다. 일반 프로세스(PID ≥ 2)는 시그널 핸들러가 없으면 커널의 기본 동작에 따라 종료됩니다. 하지만 PID 1은 핸들러가 없을 경우 시그널을 무시합니다. 이는 "Global init gets no signals it doesn't want"라는 커널 설계 원칙 때문입니다.
 
 NestJS에서 [`app.enableShutdownHooks()`](https://docs.nestjs.com/fundamentals/lifecycle-events#application-shutdown)를 통해 시그널 핸들러를 등록했다면 PID 1이라도 SIGTERM을 받을 수는 있습니다. 다만 실제 문제는 **좀비 프로세스 정리(reaping)**와 **자식/손자 프로세스에 대한 시그널 전파를 Node.js가 책임지지 않는다는 점**이었습니다.
 
@@ -61,10 +63,9 @@ NestJS에서 [`app.enableShutdownHooks()`](https://docs.nestjs.com/fundamentals/
 **dumb-init을 활용한 Dockerfile 예시:**
 
 ```dockerfile
-# Dockerfile
+# Dockerfile - dumb-init을 PID 1로 설정하여 시그널 전달 보장
 RUN apt-get update && apt-get install -y dumb-init
 
-# Node.js를 직접 실행하지 말고 dumb-init을 거침
 ENTRYPOINT ["/usr/bin/dumb-init", "--"]
 CMD ["node", "dist/main"]
 ```
@@ -73,20 +74,22 @@ CMD ["node", "dist/main"]
 
 ## 2. 2분 타임아웃 걸었는데 왜 5분을 버티지?
 
-dumb-init을 적용한 뒤 시그널은 정상적으로 전달되기 시작했습니다. 하지만 또 다른 문제가 드러났습니다. `onModuleDestroy` 훅에서 `Promise.race`를 사용해 최대 2분까지만 기다리도록 구현했음에도, 실제로는 배치가 끝날 때까지 약 5분 동안 Pod가 종료되지 않았습니다.
+dumb-init을 적용한 뒤 시그널은 정상적으로 전달되기 시작했습니다. 하지만 또 다른 문제가 드러났습니다.
+
+`onModuleDestroy` 훅에서 `Promise.race`를 사용해 최대 2분까지만 기다리도록 구현했습니다. 그런데 실제로는 배치가 끝날 때까지 약 5분 동안 Pod가 종료되지 않았습니다.
 
 ### 이벤트 루프의 문제
 
-Node.js 프로세스는 이벤트 루프가 완전히 비워져야 종료됩니다. 상황을 정리하면 다음과 같았습니다.
+[Node.js 프로세스는 이벤트 루프가 완전히 비워져야 종료](https://nodejs.org/en/learn/asynchronous-work/event-loop-timers-and-nexttick)됩니다. 상황을 정리하면 다음과 같았습니다.
 
 - `Promise.race`에서 타임아웃이 먼저 완료되어 훅 함수는 return됨
 - 하지만 패배한 `batchPromise`는 취소되지 않음
 - 내부의 `await sleep(10000)` 같은 비동기 작업이 이벤트 루프에 계속 남아 있음
 - Node.js는 "아직 처리할 작업이 남아 있다"고 판단하고 종료를 미룸
 
-**실제 로그 흐름 - 타임아웃 후에도 프로세스가 종료되지 않는 상황:**
+**타임아웃 후에도 프로세스가 종료되지 않는 로그 예시:**
 
-```
+```log
 16:07:20  K8s SIGTERM 수신 -> onModuleDestroy 호출
 16:09:20  2분 타임아웃 발생 -> 훅 함수 종료 (return)
 16:09:26  (종료되어야 하는데) 배치 작업 계속 진행 중... Iteration 15...
@@ -103,7 +106,7 @@ Node.js 프로세스는 이벤트 루프가 완전히 비워져야 종료됩니�
 
 `AbortController`를 쓰면 백그라운드에서 돌고 있는 루프를 명시적으로 멈출 수 있거든요.
 
-**AbortController를 활용한 중단 패턴 (검토했으나 미채택):**
+**검토했으나 미채택한 AbortController 패턴:**
 
 ```typescript
 async doBatch() {
@@ -138,7 +141,7 @@ async onModuleDestroy() {
 
 ### 애플리케이션 레벨: 셧다운 훅 + 타임아웃
 
-**NestJS 셧다운 훅과 타임아웃 처리:**
+**최종 적용한 NestJS 셧다운 훅:**
 
 ```typescript
 // main.ts
@@ -168,7 +171,7 @@ async onModuleDestroy() {
 
 **앱 타임아웃(2분) < K8s Grace Period(3분)**
 
-**Kubernetes Deployment 설정 예시:**
+**앱 타임아웃보다 길게 설정한 K8s Grace Period:**
 
 ```yaml
 # deployment.yaml
@@ -196,7 +199,7 @@ Node.js 이벤트 루프, PID 1 프로세스, Kubernetes 종료 정책은 서로
 
 - **Init 프로세스 사용**: [dumb-init](https://github.com/Yelp/dumb-init)이나 [tini](https://github.com/krallin/tini)로 시그널 전달 및 좀비 프로세스 방지
 - **Node 직접 실행**: `npm start` 대신 `node dist/main`으로 (시그널 전달 방해 방지)
-- **이벤트 루프 이해**: return만으로 프로세스가 종료되지 않음. 비동기 작업이 남았으면 끝날 때까지 살아있음
+- **이벤트 루프 이해**: return만으로 프로세스가 종료되지 않음. [비동기 작업이 남았으면 끝날 때까지 살아있음](https://nodejs.org/en/learn/asynchronous-work/event-loop-timers-and-nexttick)
 - **설정 동기화**: 앱 타임아웃보다 K8s [terminationGracePeriodSeconds](https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/#pod-termination)를 더 길게
 
 결국 종료 훅을 넣는 것보다 중요한 건, **내 앱의 비동기 작업이 이벤트 루프를 얼마나 점유하고 있는지 이해하고 제어하는 것**이었습니다. 개발적인 관점 너머, 여러가지 기술적인 해결책들이 있을때, 오버엔지니어링 보다는 이 문제의 배경이 무엇이고, 풀고자 하는 문제점이 무엇인지 정확하게 파악 후 해결책을 선택하는 것 또한 중요하다고 생각합니다.
